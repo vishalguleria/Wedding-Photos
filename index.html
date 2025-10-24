@@ -1,0 +1,266 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Find Your Wedding Photos</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <style>
+    body { font-family: Arial, Helvetica, sans-serif; padding: 1rem; max-width:1000px; margin:auto; }
+    h1 { text-align:center }
+    #controls { display:flex; gap:0.5rem; flex-wrap:wrap; justify-content:center; margin-bottom:1rem;}
+    #matches { display:flex; flex-wrap:wrap; gap:8px; margin-top:1rem; justify-content:center; }
+    .thumb { width:160px; height:120px; object-fit:cover; border-radius:6px; box-shadow:0 1px 6px rgba(0,0,0,0.15);}
+    #status { text-align:center; color:#333; margin-bottom:1rem; }
+    #selfiePreview { width:160px; height:160px; object-fit:cover; border-radius:80px; border:2px solid #ddd; }
+    .small { font-size:0.9rem; color:#555; }
+    button { padding:0.5rem 0.8rem; border-radius:6px; border:1px solid #ccc; background:#f7f7f7; cursor:pointer; }
+    button.primary { background:#007bff; color:white; border-color:#007bff; }
+  </style>
+</head>
+<body>
+  <h1>Scan & Find Your Wedding Photos</h1>
+  <p class="small" style="text-align:center">Take a selfie (or upload one) and we'll show photos you appear in. Everything runs in your browser.</p>
+
+  <div id="status">Loading...</div>
+
+  <div id="controls">
+    <div>
+      <video id="video" width="320" height="240" autoplay muted style="display:none;"></video>
+      <canvas id="vc" style="display:none;"></canvas>
+      <img id="selfiePreview" src="" alt="selfie" style="display:none;">
+    </div>
+
+    <div style="display:flex; flex-direction:column; gap:8px; align-items:center;">
+      <div>
+        <button id="startCam">Start Camera</button>
+        <button id="takeSelfie" class="primary" disabled>Take Selfie</button>
+      </div>
+      <div>
+        <input type="file" id="uploadSelfie" accept="image/*">
+      </div>
+      <div>
+        <button id="findMatches" disabled>Find My Photos</button>
+      </div>
+      <div>
+        <button id="clearCache">Clear Descriptor Cache</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="progress" class="small" style="text-align:center"></div>
+
+  <div id="matches"></div>
+
+  <!-- face-api.js from CDN -->
+  <script defer src="https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/dist/face-api.min.js"></script>
+
+  <script>
+  // CONFIG
+  const MODELS_PATH = '/models';       // ensure models are at /models in repo (GitHub Pages)
+  const IMAGES_JSON = '/images.json';  // ensure images.json is placed in repo root
+  const DESCRIPTORS_JSON = '/descriptors.json'; // optional precomputed descriptors
+  const DESCRIPTOR_CACHE_KEY = 'wedding_descriptors_v1';
+
+  // Globals
+  let imageUrls = [];
+  let labeledDescriptors = []; // array of { url, descriptor: Float32Array }
+
+  const statusEl = document.getElementById('status');
+  const progressEl = document.getElementById('progress');
+  const matchesEl = document.getElementById('matches');
+  const videoEl = document.getElementById('video');
+  const vc = document.getElementById('vc');
+  const selfiePreview = document.getElementById('selfiePreview');
+
+  async function init() {
+    statusEl.textContent = 'Loading face models...';
+    await faceapi.nets.tinyFaceDetector.loadFromUri(MODELS_PATH);
+    await faceapi.nets.faceLandmark68Net.loadFromUri(MODELS_PATH);
+    await faceapi.nets.faceRecognitionNet.loadFromUri(MODELS_PATH);
+    statusEl.textContent = 'Models loaded. Loading image list...';
+
+    // load images.json
+    const res = await fetch(IMAGES_JSON);
+    if (!res.ok) {
+      statusEl.textContent = 'Error loading images.json. Make sure images.json exists and is accessible.';
+      return;
+    }
+    imageUrls = await res.json();
+    statusEl.textContent = `Found ${imageUrls.length} photos. Preparing descriptors...`;
+
+    // If descriptors.json exists (precomputed), load it
+    const preRes = await fetch(DESCRIPTORS_JSON).catch(()=>null);
+    if (preRes && preRes.ok) {
+      statusEl.textContent = 'Loading precomputed descriptors...';
+      const pre = await preRes.json();
+      labeledDescriptors = pre.map(p => ({ url: p.url, descriptor: new Float32Array(p.descriptor) }));
+      statusEl.textContent = `Loaded precomputed descriptors for ${labeledDescriptors.length} images. Ready.`;
+      enableControls();
+      return;
+    }
+
+    // try load cached descriptors
+    const cached = localStorage.getItem(DESCRIPTOR_CACHE_KEY);
+    if (cached) {
+      try {
+        const parsed = JSON.parse(cached);
+        labeledDescriptors = parsed.map(p => ({ url: p.url, descriptor: new Float32Array(p.descriptor) }));
+        statusEl.textContent = `Loaded ${labeledDescriptors.length} cached descriptors. Ready.`;
+        enableControls();
+        return;
+      } catch (e) {
+        console.warn('Failed to load cache', e);
+      }
+    }
+
+    // no cache: compute descriptors (this runs once)
+    statusEl.textContent = 'No cached descriptors. Computing descriptors (this runs once in-browser)...';
+    progressEl.textContent = 'Computing 0 / ' + imageUrls.length;
+    labeledDescriptors = [];
+    for (let i=0;i<imageUrls.length;i++){
+      progressEl.textContent = `Computing ${i+1} / ${imageUrls.length}`;
+      try {
+        const desc = await computeDescriptorForImage(imageUrls[i]);
+        if (desc) labeledDescriptors.push({ url: imageUrls[i], descriptor: desc });
+      } catch(e) {
+        console.warn('Error for', imageUrls[i], e);
+      }
+    }
+    progressEl.textContent = '';
+    statusEl.textContent = `Computed descriptors for ${labeledDescriptors.length} images. Caching...`;
+    const cacheData = labeledDescriptors.map(ld => ({ url: ld.url, descriptor: Array.from(ld.descriptor) }));
+    try {
+      localStorage.setItem(DESCRIPTOR_CACHE_KEY, JSON.stringify(cacheData));
+      statusEl.textContent = `Prepared descriptors for ${labeledDescriptors.length} photos. Ready.`;
+    } catch(e) {
+      console.warn('Cache failed', e);
+      statusEl.textContent = `Prepared descriptors for ${labeledDescriptors.length} photos. (Cache failed)`;
+    }
+    enableControls();
+  }
+
+  function enableControls(){
+    document.getElementById('startCam').disabled = false;
+    document.getElementById('takeSelfie').disabled = false;
+    document.getElementById('findMatches').disabled = false;
+  }
+
+  async function computeDescriptorForImage(url){
+    return new Promise(async (resolve) => {
+      const img = new Image();
+      img.crossOrigin = "anonymous";
+      img.src = url + (url.indexOf('?')>-1 ? '&' : '?') + 'cachebuster=' + Date.now();
+      img.onload = async () => {
+        const maxDim = 800;
+        let scale = 1;
+        if (img.width > maxDim || img.height > maxDim) {
+          scale = Math.max(img.width / maxDim, img.height / maxDim);
+        }
+        const w = Math.round(img.width/scale), h = Math.round(img.height/scale);
+        const canvas = document.createElement('canvas');
+        canvas.width = w; canvas.height = h;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(img, 0, 0, w, h);
+        const detection = await faceapi.detectSingleFace(canvas, new faceapi.TinyFaceDetectorOptions()).withFaceLandmarks().withFaceDescriptor();
+        if (detection && detection.descriptor) {
+          resolve(new Float32Array(detection.descriptor));
+        } else {
+          resolve(null);
+        }
+      };
+      img.onerror = () => { resolve(null); };
+    });
+  }
+
+  // CAMERA + UI handlers
+  document.getElementById('startCam').addEventListener('click', async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio:false });
+      videoEl.srcObject = stream;
+      videoEl.style.display = 'block';
+      selfiePreview.style.display = 'none';
+      document.getElementById('takeSelfie').disabled = false;
+    } catch (e) {
+      alert('Camera not available: ' + e.message);
+    }
+  });
+
+  document.getElementById('takeSelfie').addEventListener('click', () => {
+    if (!videoEl.srcObject) { alert('Start camera first'); return; }
+    vc.width = videoEl.videoWidth;
+    vc.height = videoEl.videoHeight;
+    const ctx = vc.getContext('2d');
+    ctx.drawImage(videoEl, 0, 0, vc.width, vc.height);
+    const data = vc.toDataURL('image/jpeg', 0.9);
+    selfiePreview.src = data;
+    selfiePreview.style.display = 'block';
+    const tracks = videoEl.srcObject.getTracks();
+    tracks.forEach(t => t.stop());
+    videoEl.style.display = 'none';
+  });
+
+  document.getElementById('uploadSelfie').addEventListener('change', (ev) => {
+    const file = ev.target.files[0];
+    if (!file) return;
+    const url = URL.createObjectURL(file);
+    selfiePreview.src = url;
+    selfiePreview.style.display = 'block';
+  });
+
+  document.getElementById('findMatches').addEventListener('click', async () => {
+    if (!selfiePreview.src) { alert('Take or upload a selfie first'); return; }
+    statusEl.textContent = 'Analyzing selfie...';
+    const img = new Image();
+    img.src = selfiePreview.src;
+    img.crossOrigin = 'anonymous';
+    img.onload = async () => {
+      const detection = await faceapi.detectSingleFace(img, new faceapi.TinyFaceDetectorOptions()).withFaceLandmarks().withFaceDescriptor();
+      if (!detection || !detection.descriptor) {
+        statusEl.textContent = 'No face found in selfie. Try another selfie or upload a clearer photo.';
+        return;
+      }
+      const queryDesc = new Float32Array(detection.descriptor);
+      statusEl.textContent = 'Comparing with photos...';
+      progressEl.textContent = 'Comparing 0 / ' + labeledDescriptors.length;
+      const matches = [];
+      for (let i=0;i<labeledDescriptors.length;i++){
+        progressEl.textContent = `Comparing ${i+1} / ${labeledDescriptors.length}`;
+        const d = faceapi.euclideanDistance(queryDesc, labeledDescriptors[i].descriptor);
+        if (d <= 0.60) {
+          matches.push({ url: labeledDescriptors[i].url, distance: d });
+        }
+        if (i % 50 === 0) await new Promise(r => setTimeout(r, 10));
+      }
+      progressEl.textContent = '';
+      statusEl.textContent = `Found ${matches.length} matching photos.`;
+      showMatches(matches.sort((a,b)=>a.distance - b.distance));
+    };
+    img.onerror = () => { statusEl.textContent = 'Error loading selfie.'; };
+  });
+
+  function showMatches(matches){
+    matchesEl.innerHTML = '';
+    if (matches.length === 0) {
+      matchesEl.innerHTML = '<p class="small">No photos found matching this person. Try another selfie or upload a different photo.</p>';
+      return;
+    }
+    for (const m of matches) {
+      const img = document.createElement('img');
+      img.src = m.url;
+      img.className = 'thumb';
+      img.title = 'Distance: ' + m.distance.toFixed(3);
+      matchesEl.appendChild(img);
+    }
+  }
+
+  // clear cache button
+  document.getElementById('clearCache').addEventListener('click', () => {
+    localStorage.removeItem(DESCRIPTOR_CACHE_KEY);
+    alert('Descriptor cache cleared. Reload page to recompute descriptors.');
+  });
+
+  // init
+  init();
+  </script>
+</body>
+</html>
